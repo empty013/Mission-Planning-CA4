@@ -8,7 +8,8 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from math import pi, sqrt, atan2, tan
 from os import system, name
-from time import time
+# from time import time
+import time
 import re
 import fileinput
 import sys
@@ -33,10 +34,7 @@ import copy
 from utils.car import SimpleCar
 from utils.environment import Environment_robplan
 from utils.grid import Grid_robplan
-
-
-# from utils.dubins_path import DubinsPath
-
+from utils.dubins_path import DubinsPath
 """ ----------------------------------------------------------------------------------
 Mission planner for Autonomos robots: TTK4192,NTNU. 
 Date:20.03.23
@@ -88,19 +86,227 @@ class HybridAstar:
         self.dt = dt
         self.check_dubins = check_dubins
 
+        # Copied code from CA1
+        self.start = self.car.start_pos
+        self.goal = self.car.end_pos
+
+        self.r = self.car.l / tan(self.car.max_phi)
+        self.drive_steps = int(sqrt(2)*self.grid.cell_size/self.dt) + 1
+        self.arc = self.drive_steps * self.dt
+        self.phil = [-self.car.max_phi, 0, self.car.max_phi]
+        self.ml = [1, -1]
+
+        if reverse:
+            self.comb = list(product(self.ml, self.phil))
+        else:
+            self.comb = list(product([1], self.phil))
+
+        self.dubins = DubinsPath(self.car)
+        self.astar = Astar(self.grid, self.goal[:2])
+        
+        self.w1 = 0.95 # weight for astar heuristic
+        self.w2 = 0.05 # weight for simple heuristic
+        self.w3 = 0.30 # weight for extra cost of steering angle change
+        self.w4 = 0.10 # weight for extra cost of turning
+        self.w5 = 2.00 # weight for extra cost of reversing
+
+        self.thetas = get_discretized_thetas(self.unit_theta)
+    
+    def construct_node(self, pos):
+        """ Create node for a pos. """
+
+        theta = pos[2]
+        pt = pos[:2]
+
+        theta = round_theta(theta % (2*pi), self.thetas)
+        
+        cell_id = self.grid.to_cell_id(pt)
+        grid_pos = cell_id + [theta]
+
+        node = Node(grid_pos, pos)
+
+        return node
+    
+    def simple_heuristic(self, pos):
+        """ Heuristic by Manhattan distance. """
+
+        return abs(self.goal[0]-pos[0]) + abs(self.goal[1]-pos[1])
+        
+    def astar_heuristic(self, pos):
+        """ Heuristic by standard astar. """
+
+        h1 = self.astar.search_path(pos[:2]) * self.grid.cell_size
+        h2 = self.simple_heuristic(pos[:2])
+        
+        return self.w1*h1 + self.w2*h2
+
+    def get_children(self, node, heu, extra):
+        """ Get successors from a state. """
+
+        children = []
+        for m, phi in self.comb:
+
+            # don't go back
+            if node.m and node.phi == phi and node.m*m == -1:
+                continue
+
+            if node.m and node.m == 1 and m == -1:
+                continue
+
+            pos = node.pos
+            branch = [m, pos[:2]]
+
+            for _ in range(self.drive_steps):
+                pos = self.car.step(pos, phi, m)
+                branch.append(pos[:2])
+
+            # check safety of route-----------------------
+            pos1 = node.pos if m == 1 else pos
+            pos2 = pos if m == 1 else node.pos
+            if phi == 0:
+                safe = self.dubins.is_straight_route_safe(pos1, pos2)
+            else:
+                d, c, r = self.car.get_params(pos1, phi)
+                safe = self.dubins.is_turning_route_safe(pos1, pos2, d, c, r)
+            # --------------------------------------------
+            
+            if not safe:
+                continue
+            
+            child = self.construct_node(pos)
+            child.phi = phi
+            child.m = m
+            child.parent = node
+            child.g = node.g + self.arc
+            child.g_ = node.g_ + self.arc
+
+            if extra:
+                # extra cost for changing steering angle
+                if phi != node.phi:
+                    child.g += self.w3 * self.arc
+                
+                # extra cost for turning
+                if phi != 0:
+                    child.g += self.w4 * self.arc
+                
+                # extra cost for reverse
+                if m == -1:
+                    child.g += self.w5 * self.arc
+
+            if heu == 0:
+                child.f = child.g + self.simple_heuristic(child.pos)
+            if heu == 1:
+                child.f = child.g + self.astar_heuristic(child.pos)
+            
+            children.append([child, branch])
+
+        return children
+    
+    def best_final_shot(self, open_, closed_, best, cost, d_route, n=10):
+        """ Search best final shot in open set. """
+
+        open_.sort(key=lambda x: x.f, reverse=False)
+
+        for t in range(min(n, len(open_))):
+            best_ = open_[t]
+            solutions_ = self.dubins.find_tangents(best_.pos, self.goal)
+            d_route_, cost_, valid_ = self.dubins.best_tangent(solutions_)
+        
+            if valid_ and cost_ + best_.g_ < cost + best.g_:
+                best = best_
+                cost = cost_
+                d_route = d_route_
+        
+        if best in open_:
+            open_.remove(best)
+            closed_.append(best)
+        
+        return best, cost, d_route
+    
+    def backtracking(self, node):
+        """ Backtracking the path. """
+
+        route = []
+        while node.parent:
+            route.append((node.pos, node.phi, node.m))
+            node = node.parent
+        
+        return list(reversed(route))
+    
     def search_path(self, heu=1, extra=False):
         """ Hybrid A* pathfinding. """
+
+        root = self.construct_node(self.start)
+        root.g = float(0)
+        root.g_ = float(0)
+        
+        if heu == 0:
+            root.f = root.g + self.simple_heuristic(root.pos)
+        if heu == 1:
+            root.f = root.g + self.astar_heuristic(root.pos)
+
+        closed_ = []
+        open_ = [root]
+
+        count = 0
+        while open_:
+            count += 1
+            best = min(open_, key=lambda x: x.f)
+
+            open_.remove(best)
+            closed_.append(best)
+
+            # check dubins path
+            if count % self.check_dubins == 0:
+                solutions = self.dubins.find_tangents(best.pos, self.goal)
+                d_route, cost, valid = self.dubins.best_tangent(solutions)
+                
+                if valid:
+                    best, cost, d_route = self.best_final_shot(open_, closed_, best, cost, d_route)
+                    route = self.backtracking(best) + d_route
+                    path = self.car.get_path(self.start, route)
+                    cost += best.g_
+                    print('Shortest path: {}'.format(round(cost, 2)))
+                    print('Total iteration:', count)
+                    
+                    return path, closed_
+
+            children = self.get_children(best, heu, extra)
+
+            for child, branch in children:
+
+                if child in closed_:
+                    continue
+
+                if child not in open_:
+                    best.branches.append(branch)
+                    open_.append(child)
+
+                elif child.g < open_[open_.index(child)].g:
+                    best.branches.append(branch)
+
+                    c = open_[open_.index(child)]
+                    p = c.parent
+                    for b in p.branches:
+                        if same_point(b[-1], c.pos[:2]):
+                            p.branches.remove(b)
+                            break
+                    
+                    open_.remove(child)
+                    open_.append(child)
+
         return None, None
 
 
 def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
 
     tc = map_grid_robplan()
-    env = Environment_robplan(tc.obs)
-    car = SimpleCar(env, start_pos, end_pos)
+    env = Environment_robplan(tc.obs, lx=5.0*10, ly=2.9*10)
+    # env = Environment_robplan(lx=20)
+    car = SimpleCar(env, start_pos, end_pos, l=0.5)
     grid = Grid_robplan(env)
 
-    hastar = HybridAstar(car, grid, reverse)
+    hastar = HybridAstar(car, grid, reverse, dt=0.1)
 
     t = time.time()
     path, closed_ = hastar.search_path(heu, extra)
@@ -140,8 +346,8 @@ def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
     xl_np=xl_np-20
     yl_np=np.array(yl_np1)
     yl_np=yl_np-11.2
-    global WAYPOINTS
-    WAYPOINTS=np.column_stack([xl_np,yl_np])
+    global WAYPOINTS_MOVE
+    WAYPOINTS_MOVE=np.column_stack([xl_np,yl_np])
     #print(WAYPOINTS)
     
     start_state = car.get_car_state(car.start_pos)
@@ -167,6 +373,10 @@ def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
     for ob in env.obs:
         ax.add_patch(Rectangle((ob.x, ob.y), ob.w, ob.h, fc='gray', ec='k'))
     
+    for wp in WAYPOINTS:
+        print(wp)
+        ax.plot(wp[0], wp[1], 'ro', markersize=6)
+
     ax.plot(car.start_pos[0], car.start_pos[1], 'ro', markersize=6)
     ax = plot_a_car(ax, end_state.model)
     ax = plot_a_car(ax, start_state.model)
@@ -235,7 +445,7 @@ def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
         return _branches, _path, _carl, _path1, _car
 
     ani = animation.FuncAnimation(fig, animate, init_func=init, frames=frames,
-                                  interval=1, repeat=True, blit=True)
+                                  interval=10, repeat=True, blit=True)
 
     plt.show()
 
@@ -244,14 +454,41 @@ def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
 class map_grid_robplan:
     def __init__(self):
 
-        self.start_pos2 = [4, 4, 0]
-        self.end_pos2 = [4, 8, -pi]
-        self.obs = [
-            [25, 0, 15, 2], 
-            [0, 0, 1.37, 1.37],   
-            [38.6, 2, 1.37, 1.37], 
-            [25.5, 21, 1.37, 1.37],   
+        # self.start_pos2 = [4, 4, 0]
+        # self.end_pos2 = [4, 8, -pi]
+        # self.obs = [
+            # [25, 0, 15, 2], 
+            # [0, 0, 1.37, 1.37],   
+            # [38.6, 2, 1.37, 1.37], 
+            # [25.5, 21, 1.37, 1.37],   
+            # [0, 0, 5, 2.6]
+        # ]
+        
+        # x and y are the coordinates for the lower left corener
+        # w, h are width and height
+        # [x, y, w, h]
+        scale = 10
+        # MIDDLE BOXES
+        obs = [
+            [1.0, 1.5, 0.4, 0.8],
+            [1.5, 1.5, 0.4, 0.8],
+            [2.0, 1.5, 0.7, 0.8]
         ]
+
+        # Obstacles defined by waypoints
+        obs.extend([
+            [WAYPOINTS[6][0]/scale-0.4, WAYPOINTS[6][1]/scale, 0.8, 0.5],
+            [WAYPOINTS[1][0]/scale-0.45, (WAYPOINTS[1][1]+2)/scale, 0.9, 0.3],
+            [WAYPOINTS[1][0]/scale-0.45+0.9+0.2, (WAYPOINTS[1][1]+1)/scale, 0.9, 0.3],
+        ])
+
+        # Addind the wall obstacles
+        obs.extend([
+            [0, 1.0, 0.5, 0.2],
+            [3.0, 0.0, 2, 0.3]
+        ])
+        obs_ = scale * np.array(obs)
+        self.obs = obs_.tolist()
         
 #3) GNC module (path-followig and PID controller for the robot) ------------------------------
 """  Robot Guidance navigation and control module 
@@ -322,7 +559,7 @@ class turtlebot_move():
         self.trajectory = list()
 
         # track a sequence of waypoints
-        for point in WAYPOINTS:
+        for point in WAYPOINTS_MOVE:
             self.move_to_point(point[0], point[1])
             rospy.sleep(1)
         self.stop()
@@ -420,7 +657,7 @@ class turtlebot_move():
 """
 Turtlebot 3 actions-------------------------------------------------------------------------
 """
-
+1
 class TakePhoto:
     def __init__(self):
 
@@ -480,11 +717,11 @@ def taking_photo_exe():
 def move_robot_waypoint0_waypoint1():
     # This function executes Move Robot from 1 to 2
     # This function uses hybrid A-star
-    a=0
-    while a<3:
-        print("Excuting Mr12")
-        time.sleep(1)
-        a=a+1
+    # a=0
+    # while a<3:
+    #     print("Excuting Mr12")
+    #     time.sleep(1)
+    #     a=a+1
     print("Computing hybrid A* path")
 	
     p = argparse.ArgumentParser()
@@ -493,11 +730,14 @@ def move_robot_waypoint0_waypoint1():
     p.add_argument('-e', action='store_true', help='add extra cost or not')
     p.add_argument('-g', action='store_true', help='show grid or not')
     args = p.parse_args()
-    start_pos = [2, 2, 0]
-    end_pos = [6, 6, 3*pi/4]
+    # start_pos = [10*0.2, 10*0.2, 0]
+    # end_pos = [2.3, 1.3, 0]
+    start_pos = [1, 1, 0]
+    end_pos = [1.1, 1, 0]
     main_hybrid_a(args.heu,start_pos,end_pos,args.r,args.e,args.g)
     print("Executing path following")
     turtlebot_move()
+
 
 
 def Manipulate_OpenManipulator_x():
@@ -570,7 +810,7 @@ def check_seals_valve_picture_eo_waypoint0():
 
 # Charging battery 
 def charge_battery_waypoint0():
-    print("chargin battert")
+    print("chargin battery")
     time.sleep(5)
 
 import actionlib
@@ -617,22 +857,50 @@ def move_robot_experiment(target):
         rospy.loginfo ( navclient.get_result())
 
 
-def move_robot(start, end, experiment=False):
+def move_robot(start_pos, end_pos, experiment=False):
     if experiment:
-        move_robot_experiment(end)
+        move_robot_experiment(end_pos)
+    else:
+        print("Computing hybrid A* path")
+        print(f"From: {start_pos} to {end_pos}")
+	
+        p = argparse.ArgumentParser()
+        p.add_argument('-heu', type=int, default=1, help='heuristic type')
+        p.add_argument('-r', action='store_true', help='allow reverse or not')
+        p.add_argument('-e', action='store_true', help='add extra cost or not')
+        p.add_argument('-g', action='store_true', help='show grid or not')
+        args = p.parse_args()
+        main_hybrid_a(args.heu,start_pos,end_pos,args.r,args.e,args.g)
 
+def task6b():
+    # WAYPOINTS = [[], [2, 2, 0], [4, 2, 0], [8, 2, 0], [10, 2, 0]]
+    points = WAYPOINTS[1:5]
+    for i, point in enumerate(points):
+        if i == (len(points)-1):
+            return
+        start_pos = point
+        end_pos = points[i+1]
+        move_robot(start_pos=start_pos, end_pos=end_pos)
 
 # Define the global varible: WAYPOINTS  Wpts=[[x_i,y_i]];
+global WAYPOINTS_MOVE
 global WAYPOINTS
 global WAYPOINTS_DICT
 WAYPOINTS_DICT = {}
 # WAYPOINTS = [[1,1],[2,2]]
 # ORIENTATIONS = 
-WAYPOINTS = [[0.2, 0.2, 0], [1.85, 0.5, pi/2], [3, 0.91, 3*pi/2], 
+WAYPOINTS = [[0.2, 0.2, 0], [1.85, 0.5-0.1, pi/2], [3, 0.91+0.1, 3*pi/2], 
              [3.25, 2.6, pi/2], [4.8, 0.4, 0], [0.87, 2.4, pi], [3.65, 1.75, pi/2]]
+print(WAYPOINTS)
+WAYPOINTS = np.array(WAYPOINTS)
+WAYPOINTS[:,:2] = WAYPOINTS[:,:2] * 10
+WAYPOINTS = WAYPOINTS.tolist()
+
+print(WAYPOINTS)
 for ii in range(len(WAYPOINTS)):
-    key_ = "wp" + ii
+    key_ = "wp" + str(ii)
     WAYPOINTS_DICT[key_] = WAYPOINTS[ii]
+    print(WAYPOINTS_DICT[key_])
 
 
 # 5) Program here the main commands of your mission planning algorithm for turtlebot ---------------------------------
@@ -643,19 +911,15 @@ if __name__ == '__main__':
         print()
         print("************ TTK4192 - Assigment 4 **************************")
         print()
-        print("AI planners: STP/GraphPlan/Other")
-        print("Path-finding: Hybrid A-star/A*/other")
-        print("GNC Controller: PID path-following")
-        print("Robot: Turtlebot3 waffle-pi")
-        print("date: 19.03.24")
         print()
         print("**************************************************************")
         print()
         print("Press Intro to start ...")
-        input_t=input("")
+        # input_t=input("")
         
         # 5.0) Testing the GNC module         
-        #move_robot_waypoint0_waypoint1()
+        # move_robot_waypoint0_waypoint1()
+        task6b()
      
 
 	# 5.1) Starting the AI Planner
@@ -665,11 +929,24 @@ if __name__ == '__main__':
         # stp-2 
         # /home/ntnu-itk/catkin_ws/src/AI-planning/mydomain2.pddl 
         # /home/ntnu-itk/catkin_ws/src/AI-planning/myproblem2.pddl
+        command = []
 
-        arg1 = "stp-2"
-        arg2 = "/home/ntnu-itk/catkin_ws/src/AI-planning/mydomain2.pddl"
-        arg3 = "/home/ntnu-itk/catkin_ws/src/AI-planning/myproblem2.pddl"
-        subprocess.run(['python2.7', '/home/ntnu-itk/catkin_ws/src/AI-planning/temporal-planning/bin/plan.py', arg1, arg2, arg3])
+        # command = ["ls ", "~/catkin_ws/src/AI-planning/bin/"]
+        command.append("source ~/catkin_ws/src/AI-planning/bin/activate; ")
+        command.append("cd ~/catkin_ws/src/AI-planning/; ")
+        command.append('python2.7 ')
+        command.append("~/catkin_ws/src/AI-planning/temporal-planning/bin/plan.py ")
+        command.append("stp-2 ")
+        command.append("~/catkin_ws/src/AI-planning/mydomain2.pddl ")
+        command.append("~/catkin_ws/src/AI-planning/myproblem2.pddl")
+        # # arg0 = "~/catkin_ws/src/AI-planning/temporal-planning/bin/plan.py"
+        # arg1 = "stp-2"
+        # arg2 = "~/catkin_ws/src/AI-planning/mydomain2.pddl"
+        # arg3 = "~/catkin_ws/src/AI-planning/myproblem2.pddl"
+        # print(command)
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        # print("HELLO")
+        # print(result)
    
     
         # 5.2) Reading the plan 
@@ -677,9 +954,12 @@ if __name__ == '__main__':
         print("Reading the plan from AI planner")
         print("  ")
         plan_general = []
-        with open('/home/ntnu-itk/catkin_ws/src/AI-planning/tmp_sas_plan.1') as fp:
+        # /home/ttk4192/catkin_ws/src/AI-planning
+        with open(os.path.expanduser('~/catkin_ws/src/AI-planning/tmp_sas_plan.1')) as fp:
             for entry in fp:
+                print(entry)
                 task = entry.split("(")[1].split(")")[0][1:-1]
+                print(task)
                 plan_general.append(task)
         plan_general=plan_general
         print(plan_general[0])
@@ -689,20 +969,20 @@ if __name__ == '__main__':
         print("")
         print("Starting mission execution")
         # Start simulations with battery = 100%
-        plan_general = [[1, 1, pi/2]] # test_waypoint
-        battery=100
+        # plan_general = [[1, 1, pi/2]] # test_waypoint
+        # battery=100
         task_finished=0
         task_total=len(plan_general)
         i_ini=0
         while i_ini < task_total:
             # move_robot_waypoint0_waypoint1()
             #taking_photo_exe()
-
+            print(plan_general[i_ini])
             plan_temp=plan_general[i_ini].split(" ")
             print(plan_temp)
             if plan_temp[0]=="picture":
                 print("Inspect -pump" + plan_temp[1])
-                taking_photo_exe()
+                # taking_photo_exe()
                 time.sleep(1)
 
             elif plan_temp[0]=="inspect":
@@ -711,6 +991,8 @@ if __name__ == '__main__':
 
             elif plan_temp[0]=="move":
                 print("move_robot_waypoints")
+                print(WAYPOINTS_DICT[plan_temp[2]])
+                print(WAYPOINTS_DICT[plan_temp[3]])
                 move_robot(WAYPOINTS_DICT[plan_temp[2]], WAYPOINTS_DICT[plan_temp[3]])
                 time.sleep(1)
             
