@@ -12,7 +12,7 @@ r20 r21 r22 r23 r24 r25 r26 r27 - route
 
 (:init
     ;todo: put the initial state's facts and numeric values here
-    (= (robotSpeed) 1)
+    (= (robotSpeed) 0.18)
     ;(batteryCharged)
     ; (= (totalDistance) 0)
     ; (= (totalTime) 0)
