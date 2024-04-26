@@ -32,7 +32,7 @@ r20 r21 r22 r23 r24 r25 r26 r27 - route
     (isAtWaypoint pump0 wp5)
     (isAtWaypoint pump1 wp6)
     
-    (robotLocation wp0)
+    (robotLocation wp2)
 
     (connects r00 wp0 wp7) ; charger wp0
     (connects r01 wp7 wp0)
