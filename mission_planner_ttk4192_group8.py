@@ -35,6 +35,9 @@ from utils.car import SimpleCar
 from utils.environment import Environment_robplan
 from utils.grid import Grid_robplan
 from utils.dubins_path import DubinsPath
+
+# Moving the arm
+from utils.arm_control import move_arm, control_gripper
 """ ----------------------------------------------------------------------------------
 Mission planner for Autonomos robots: TTK4192,NTNU. 
 Date:20.03.23
@@ -51,6 +54,18 @@ version: 1.1
 3) other algorithm 
 """
 
+# STP Temporal planner
+def read_plan():
+    plan_general = []
+    with open(os.path.expanduser('~/catkin_ws/src/AI-planning/tmp_sas_plan.1')) as fp:
+        for entry in fp:
+            print(entry)
+            task = entry.split("(")[1].split(")")[0][1:-1]
+            print(task)
+            plan_general.append(task)
+    print(plan_general[0])
+    return plan_general
+
 
 # 2) Program here your path-finding algorithm (only one) --------------------------------------------------------------------
 """ 
@@ -58,6 +73,8 @@ version: 1.1
 2) A-star                    : Program your code
 3) Other method
 """
+
+
 
 class Node:
     """ Hybrid A* tree node. """
@@ -74,9 +91,9 @@ class Node:
         self.m = None
         self.branches = []
 
+# ----------------- Copied from CA1 ------------------------
 class HybridAstar:
     """ Hybrid A* search procedure. """
-
     def __init__(self, car, grid_robplan, reverse, unit_theta=pi/12, dt=1e-2, check_dubins=1):
         
         self.car = car
@@ -86,7 +103,6 @@ class HybridAstar:
         self.dt = dt
         self.check_dubins = check_dubins
 
-        # Copied code from CA1
         self.start = self.car.start_pos
         self.goal = self.car.end_pos
 
@@ -296,17 +312,19 @@ class HybridAstar:
                     open_.append(child)
 
         return None, None
+# ----------------- Copied from CA1 ------------------------
 
 
 def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
-
+    print(f"REVERSE: {reverse}")
     tc = map_grid_robplan()
     env = Environment_robplan(tc.obs, lx=5.0*10, ly=2.9*10)
     # env = Environment_robplan(lx=20)
     car = SimpleCar(env, start_pos, end_pos, l=0.5)
     grid = Grid_robplan(env)
 
-    hastar = HybridAstar(car, grid, reverse, dt=0.1)
+    hastar = HybridAstar(car, grid, reverse)
+    # hastar = HybridAstar(car, grid, reverse, dt=0.1)
 
     t = time.time()
     path, closed_ = hastar.search_path(heu, extra)
@@ -342,10 +360,15 @@ def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
             xl_np1.append(path[i*dt_s].pos[0])
             yl_np1.append(path[i*dt_s].pos[1])      
     # defining way-points (traslandado el origen a (0,0))
+    # xl_np=np.array(xl_np1)
+    # xl_np=xl_np-20
+    # yl_np=np.array(yl_np1)
+    # yl_np=yl_np-11.2
+
     xl_np=np.array(xl_np1)
-    xl_np=xl_np-20
+    xl_np=xl_np/10
     yl_np=np.array(yl_np1)
-    yl_np=yl_np-11.2
+    yl_np=yl_np/10
     global WAYPOINTS_MOVE
     WAYPOINTS_MOVE=np.column_stack([xl_np,yl_np])
     #print(WAYPOINTS)
@@ -373,9 +396,12 @@ def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
     for ob in env.obs:
         ax.add_patch(Rectangle((ob.x, ob.y), ob.w, ob.h, fc='gray', ec='k'))
     
+    print("Printing waypoints")
+    print()
     for wp in WAYPOINTS:
         print(wp)
         ax.plot(wp[0], wp[1], 'ro', markersize=6)
+    print()
 
     ax.plot(car.start_pos[0], car.start_pos[1], 'ro', markersize=6)
     ax = plot_a_car(ax, end_state.model)
@@ -453,17 +479,6 @@ def main_hybrid_a(heu,start_pos, end_pos,reverse, extra, grid_on):
 
 class map_grid_robplan:
     def __init__(self):
-
-        # self.start_pos2 = [4, 4, 0]
-        # self.end_pos2 = [4, 8, -pi]
-        # self.obs = [
-            # [25, 0, 15, 2], 
-            # [0, 0, 1.37, 1.37],   
-            # [38.6, 2, 1.37, 1.37], 
-            # [25.5, 21, 1.37, 1.37],   
-            # [0, 0, 5, 2.6]
-        # ]
-        
         # x and y are the coordinates for the lower left corener
         # w, h are width and height
         # [x, y, w, h]
@@ -477,7 +492,7 @@ class map_grid_robplan:
 
         # Obstacles defined by waypoints
         obs.extend([
-            [WAYPOINTS[6][0]/scale-0.4, WAYPOINTS[6][1]/scale, 0.8, 0.5],
+            [WAYPOINTS[6][0]/scale-0.4, WAYPOINTS[6][1]/scale+0.2, 0.8, 0.5],
             [WAYPOINTS[1][0]/scale-0.45, (WAYPOINTS[1][1]+2)/scale, 0.9, 0.3],
             [WAYPOINTS[1][0]/scale-0.45+0.9+0.2, (WAYPOINTS[1][1]+1)/scale, 0.9, 0.3],
         ])
@@ -560,6 +575,8 @@ class turtlebot_move():
 
         # track a sequence of waypoints
         for point in WAYPOINTS_MOVE:
+            # Ugly but necessary
+            # self.move_to_point(point[0] * 0.1, point[1] * 0.1)
             self.move_to_point(point[0], point[1])
             rospy.sleep(1)
         self.stop()
@@ -742,7 +759,25 @@ def move_robot_waypoint0_waypoint1():
 
 def Manipulate_OpenManipulator_x():
     print("Executing manipulate a weight")
+# -------------- Example from arm_control.py ------------------------
+    # Move the arm to the initial position
+    move_arm([0.0, 0.0, 0.0, 0.0], duration=2.0)
+    rospy.sleep(2)
+
+    # Open the gripper
+    control_gripper(0.01, duration=1.0)  # Adjust the position value as needed
+    rospy.sleep(1)
+
+    # Close the gripper
+    control_gripper(-0.01, duration=1.0)  # Adjust the position value as needed
+    rospy.sleep(1)
+
+    # Move the arm to home position
+    move_arm([0.0, -1.0, 0.3, 0.7], duration=2.0)  # Replace with desired joint angles
+    rospy.sleep(2)
     time.sleep(5)
+# -------------- Example from arm_control.py ------------------------
+
 
 def making_turn_exe():
     print("Executing Make a turn")
@@ -810,7 +845,7 @@ def check_seals_valve_picture_eo_waypoint0():
 
 # Charging battery 
 def charge_battery_waypoint0():
-    print("chargin battery")
+    print("charging battery")
     time.sleep(5)
 
 import actionlib
@@ -863,18 +898,16 @@ def move_robot(start_pos, end_pos, experiment=False):
     else:
         print("Computing hybrid A* path")
         print(f"From: {start_pos} to {end_pos}")
-	
-        p = argparse.ArgumentParser()
-        p.add_argument('-heu', type=int, default=1, help='heuristic type')
-        p.add_argument('-r', action='store_true', help='allow reverse or not')
-        p.add_argument('-e', action='store_true', help='add extra cost or not')
-        p.add_argument('-g', action='store_true', help='show grid or not')
-        args = p.parse_args()
-        main_hybrid_a(args.heu,start_pos,end_pos,args.r,args.e,args.g)
+        main_hybrid_a(1, start_pos=start_pos, end_pos=end_pos, 
+                      reverse=True, 
+                      extra=True,
+                      grid_on=False)
+        turtlebot_move()
 
 def task6b():
-    # WAYPOINTS = [[], [2, 2, 0], [4, 2, 0], [8, 2, 0], [10, 2, 0]]
-    points = WAYPOINTS[1:5]
+    # Waypoint 1 to 2, 2 to 3, 3 to 4
+    points = [[18.5, 5.0, 0], [30, 9, 0], [32.5, 26.5, pi/2]]
+    
     for i, point in enumerate(points):
         if i == (len(points)-1):
             return
@@ -884,17 +917,107 @@ def task6b():
 
 # Define the global varible: WAYPOINTS  Wpts=[[x_i,y_i]];
 global WAYPOINTS_MOVE
-global WAYPOINTS
 global WAYPOINTS_DICT
+global WAYPOINTS
 WAYPOINTS_DICT = {}
 # WAYPOINTS = [[1,1],[2,2]]
 # ORIENTATIONS = 
-WAYPOINTS = [[0.2, 0.2, 0], [1.85, 0.5-0.1, pi/2], [3, 0.91+0.1, 3*pi/2], 
-             [3.25, 2.6, pi/2], [4.8, 0.4, 0], [0.87, 2.4, pi], [3.65, 1.75, pi/2]]
+WAYPOINTS = [[0.2, 0.2, 0], [1.85, 0.6-0.1, pi/2], [3, 0.91+0.1, 3*pi/2], 
+             [3.25, 2.6, pi/2], [4.8, 0.4, 0], [0.87, 2.4, pi], [3.65, 1.7-0.1, pi/2], 
+             [8, 5, pi/4], [23.8, 4.3, pi/2], [24.2, 12.2, 0], 
+             [30.2, 13.5, pi/2], [39, 10, pi]]
 print(WAYPOINTS)
 WAYPOINTS = np.array(WAYPOINTS)
-WAYPOINTS[:,:2] = WAYPOINTS[:,:2] * 10
+WAYPOINTS[:7,:2] = WAYPOINTS[:7,:2] * 10
 WAYPOINTS = WAYPOINTS.tolist()
+
+switch_Dict = {}
+
+def map_direction(command : str):
+    # r25
+    print(f"map_direction {command}")
+
+    print(f"Befire: {WAYPOINTS[5]}")
+    # 7->5 and 5->7
+    if command == 'r21':
+        WAYPOINTS[5][2] = pi/2
+        print(f"After: {WAYPOINTS[5]}")
+    if command == 'r20':
+        WAYPOINTS[7][2] = 0
+    
+    # 2->9 and 9->2
+    if command == 'r06':
+        WAYPOINTS[7][2] = pi
+    if command == 'r09':
+        WAYPOINTS[2][2] = pi/4
+    
+
+    # 3->10 and 10->3
+    if command == 'r13':
+        WAYPOINTS[10][2] = 7*pi/4
+    if command == 'r15':
+        WAYPOINTS[3][2] = pi/2
+    
+
+    # 10->2 and 2->10
+    if command == 'r10':
+        WAYPOINTS[2][2] = 3*pi/2
+    if command == 'r07':
+        WAYPOINTS[10][2] = pi/4
+    
+
+    # 10->6 and 6->10
+    if command == 'r24':
+        WAYPOINTS[6][2] = 0
+    if command == 'r22':
+        WAYPOINTS[10][2] = pi
+
+    # 6->11 and 11->6
+    if command == 'r23':
+        WAYPOINTS[11][2] = 3*pi/2
+    if command == 'r25':
+        WAYPOINTS[6][2] = 3*pi/4
+    
+    # 4->11 and 11->4
+    if command == 'r17':
+        WAYPOINTS[11][2] = 3*pi/4
+    if command == 'r19':
+        WAYPOINTS[4][2] = 7*pi/4
+    
+
+    # 11->2 and 2->11
+    if command == 'r11':
+        WAYPOINTS[2][2] = pi
+    if command == 'r08':
+        WAYPOINTS[11][2] = 0
+
+    
+    # 9->8 and 8->9
+    if command == 'r27':
+        WAYPOINTS[8][2] = 3*pi/2
+    if command == 'r26':
+        WAYPOINTS[9][2] = pi/2
+
+    
+    # 8->1 and 1->8
+    if command == 'r05':
+        WAYPOINTS[1][2] = pi
+    if command == 'r03':
+        WAYPOINTS[8][2] = 0
+    
+    # 1->7 and 7->1
+    if command == 'r02':
+        WAYPOINTS[7][2] = pi
+    if command == 'r04':
+        WAYPOINTS[1][2] = 0
+    
+    # 3->5 and 5->3
+    if command == 'r12':
+        WAYPOINTS[5][2] = pi
+    if command == 'r14':
+        WAYPOINTS[3][2] = 3*pi/2
+    
+
 
 print(WAYPOINTS)
 for ii in range(len(WAYPOINTS)):
@@ -919,7 +1042,7 @@ if __name__ == '__main__':
         
         # 5.0) Testing the GNC module         
         # move_robot_waypoint0_waypoint1()
-        task6b()
+        # task6b()
      
 
 	# 5.1) Starting the AI Planner
@@ -939,47 +1062,37 @@ if __name__ == '__main__':
         command.append("stp-2 ")
         command.append("~/catkin_ws/src/AI-planning/mydomain2.pddl ")
         command.append("~/catkin_ws/src/AI-planning/myproblem2.pddl")
-        # # arg0 = "~/catkin_ws/src/AI-planning/temporal-planning/bin/plan.py"
-        # arg1 = "stp-2"
-        # arg2 = "~/catkin_ws/src/AI-planning/mydomain2.pddl"
-        # arg3 = "~/catkin_ws/src/AI-planning/myproblem2.pddl"
-        # print(command)
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        # print("HELLO")
+        tmp = ""
+        for c_ in command:
+            tmp = tmp + c_
+        # print(tmp)
+        result = subprocess.run(tmp, shell=True, capture_output=True, text=True)
         # print(result)
-   
+        # input("")
     
         # 5.2) Reading the plan 
         print("  ")
         print("Reading the plan from AI planner")
         print("  ")
-        plan_general = []
-        # /home/ttk4192/catkin_ws/src/AI-planning
-        with open(os.path.expanduser('~/catkin_ws/src/AI-planning/tmp_sas_plan.1')) as fp:
-            for entry in fp:
-                print(entry)
-                task = entry.split("(")[1].split(")")[0][1:-1]
-                print(task)
-                plan_general.append(task)
-        plan_general=plan_general
-        print(plan_general[0])
+        plan_general = read_plan()
 
         # 5.3) Start mission execution 
         # convert string into functions and executing
         print("")
         print("Starting mission execution")
-        # Start simulations with battery = 100%
-        # plan_general = [[1, 1, pi/2]] # test_waypoint
-        # battery=100
+        battery=100
         task_finished=0
         task_total=len(plan_general)
         i_ini=0
+
         while i_ini < task_total:
             # move_robot_waypoint0_waypoint1()
             #taking_photo_exe()
-            print(plan_general[i_ini])
+
+            # print(plan_general[i_ini])
             plan_temp=plan_general[i_ini].split(" ")
             print(plan_temp)
+            
             if plan_temp[0]=="picture":
                 print("Inspect -pump" + plan_temp[1])
                 # taking_photo_exe()
@@ -987,13 +1100,24 @@ if __name__ == '__main__':
 
             elif plan_temp[0]=="inspect":
                 print("check-valve" + plan_temp[1])
+                # taking_photo_exe()
+                # Manipulate_OpenManipulator_x()
                 time.sleep(1)
-
+            
             elif plan_temp[0]=="move":
                 print("move_robot_waypoints")
-                print(WAYPOINTS_DICT[plan_temp[2]])
-                print(WAYPOINTS_DICT[plan_temp[3]])
-                move_robot(WAYPOINTS_DICT[plan_temp[2]], WAYPOINTS_DICT[plan_temp[3]])
+                map_direction(plan_temp[1])
+                start_pos = WAYPOINTS[int(plan_temp[2][2:])]
+                print(f"start_pos_index {int(plan_temp[2][2:])}")
+                print(f"end_pos_index {int(plan_temp[3][2:])}")
+                end_pos = WAYPOINTS[int(plan_temp[3][2:])]
+                print(f"startpos {start_pos}")
+                print(f"endpos {end_pos}")
+                move_robot(start_pos=start_pos, end_pos=end_pos)
+                # print(WAYPOINTS_DICT[plan_temp[2]])
+                # print(WAYPOINTS_DICT[plan_temp[3]])
+                # move_robot(WAYPOINTS_DICT[plan_temp[2]], WAYPOINTS_DICT[plan_temp[3]])
+                
                 time.sleep(1)
             
             elif plan_temp[0]=="charge":
